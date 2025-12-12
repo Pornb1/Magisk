@@ -4,7 +4,6 @@
 #include <libgen.h>
 
 #include <base.hpp>
-#include <flags.h>
 #include <consts.hpp>
 
 #include "init.hpp"
@@ -31,21 +30,21 @@ static void parse_device(devinfo *dev, const char *uevent) {
     dev->devpath[0] = '\0';
     dev->dmname[0] = '\0';
     dev->devname[0] = '\0';
-    parse_prop_file(uevent, [=](string_view key, string_view value) -> bool {
+    parse_prop_file(uevent, [=](Utf8CStr key, Utf8CStr value) -> bool {
         if (key == "MAJOR")
-            dev->major = parse_int(value.data());
+            dev->major = parse_int(value);
         else if (key == "MINOR")
-            dev->minor = parse_int(value.data());
+            dev->minor = parse_int(value);
         else if (key == "DEVNAME")
-            strscpy(dev->devname, value.data(), sizeof(dev->devname));
+            strscpy(dev->devname, value.c_str(), sizeof(dev->devname));
         else if (key == "PARTNAME")
-            strscpy(dev->partname, value.data(), sizeof(dev->devname));
+            strscpy(dev->partname, value.c_str(), sizeof(dev->devname));
 
         return true;
     });
 }
 
-void MagiskInit::collect_devices() {
+void MagiskInit::collect_devices() const noexcept {
     char path[PATH_MAX];
     devinfo dev{};
     if (auto dir = xopen_dir("/sys/dev/block"); dir) {
@@ -60,10 +59,10 @@ void MagiskInit::collect_devices() {
                 strscpy(dev.dmname, name.data(), sizeof(dev.dmname));
             }
             if (auto it = std::ranges::find_if(config.partition_map, [&](const auto &i) {
-                return i.first == dev.devname;
+                return i.key == dev.devname;
             }); dev.partname[0] == '\0' && it != config.partition_map.end()) {
                 // use androidboot.partition_map as partname fallback.
-                strscpy(dev.partname, it->second.data(), sizeof(dev.partname));
+                strscpy(dev.partname, it->value.data(), sizeof(dev.partname));
             }
             sprintf(path, "/sys/dev/block/%s", entry->d_name);
             xrealpath(path, dev.devpath, sizeof(dev.devpath));
@@ -72,7 +71,7 @@ void MagiskInit::collect_devices() {
     }
 }
 
-dev_t MagiskInit::find_block(const char *partname) {
+uint64_t MagiskInit::find_block(const char *partname) const noexcept {
     if (dev_list.empty())
         collect_devices();
 
@@ -103,11 +102,11 @@ dev_t MagiskInit::find_block(const char *partname) {
     return 0;
 }
 
-void MagiskInit::mount_preinit_dir() {
+void MagiskInit::mount_preinit_dir() noexcept {
     if (preinit_dev.empty()) return;
-    auto dev = find_block(preinit_dev.data());
+    auto dev = find_block(preinit_dev.c_str());
     if (dev == 0) {
-        LOGE("Cannot find preinit %s, abort!\n", preinit_dev.data());
+        LOGE("Cannot find preinit %s, abort!\n", preinit_dev.c_str());
         return;
     }
     xmknod(PREINITDEV, S_IFBLK | 0600, dev);
@@ -123,8 +122,7 @@ void MagiskInit::mount_preinit_dir() {
 
     // Since we are mounting the block device directly, make sure to ONLY mount the partitions
     // as read-only, or else the kernel might crash due to crappy drivers.
-    // After the device boots up, magiskd will properly bind mount the correct partition
-    // on to PREINITMIRR as writable. For more details, check bootstages.cpp
+    // After the device boots up, magiskd will properly symlink the correct path at PREINITMIRR as writable.
     if (mounted || mount(PREINITDEV, MIRRDIR, "ext4", MS_RDONLY, nullptr) == 0 ||
         mount(PREINITDEV, MIRRDIR, "f2fs", MS_RDONLY, nullptr) == 0) {
         string preinit_dir = resolve_preinit_dir(MIRRDIR);
@@ -138,12 +136,13 @@ void MagiskInit::mount_preinit_dir() {
         }
         xumount2(MIRRDIR, MNT_DETACH);
     } else {
-        PLOGE("Failed to mount preinit %s\n", preinit_dev.data());
-        unlink(PREINITDEV);
+        PLOGE("Mount preinit %s", preinit_dev.c_str());
+        // Do NOT delete the block device. Even though we cannot mount it here,
+        // it might get formatted later in the boot process.
     }
 }
 
-bool MagiskInit::mount_system_root() {
+bool MagiskInit::mount_system_root() noexcept {
     LOGD("Mounting system_root\n");
 
     // there's no /dev in stub cpio
@@ -163,7 +162,7 @@ bool MagiskInit::mount_system_root() {
 
         // Try normal partname
         char sys_part[32];
-        sprintf(sys_part, "system%s", config.slot);
+        sprintf(sys_part, "system%s", config.slot.data());
         dev = find_block(sys_part);
         if (dev > 0)
             goto mount_root;
@@ -210,27 +209,7 @@ mount_root:
     return is_two_stage;
 }
 
-void MagiskInit::exec_init() {
-    // Unmount in reverse order
-    for (auto &p : reversed(mount_list)) {
-        if (xumount2(p.data(), MNT_DETACH) == 0)
-            LOGD("Unmount [%s]\n", p.data());
-    }
-    execve("/init", argv, environ);
-    exit(1);
-}
-
-void MagiskInit::prepare_data() {
-    LOGD("Setup data tmp\n");
-    xmkdir("/data", 0755);
-    xmount("magisk", "/data", "tmpfs", 0, "mode=755");
-
-    cp_afc("/init", REDIR_PATH);
-    cp_afc("/.backup", "/data/.backup");
-    cp_afc("/overlay.d", "/data/overlay.d");
-}
-
-void MagiskInit::setup_tmp(const char *path) {
+void MagiskInit::setup_tmp(const char *path) noexcept {
     LOGD("Setup Magisk tmp at %s\n", path);
     chdir("/data");
 
